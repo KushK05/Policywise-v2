@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { auth, apiFetch } from './authClient';
 import { Toaster, toast } from 'react-hot-toast';
@@ -17,6 +17,90 @@ export default function App() {
     const [fullName, setFullName] = useState(null);
     const [username, setUsername] = useState(null);
     const [loading, setLoading] = useState(true);
+    const fetchUserDataPromiseRef = useRef(null);
+
+    const applyUserData = useCallback((userData = {}) => {
+        // Auth is owned by Cognito/NestJS now; profile data is useful for UI,
+        // but missing profile fields should not block a valid login session.
+        const rawRole = String(userData.role || userData['custom:role'] || 'client').toLowerCase();
+        const userRole = rawRole === 'admin' ? 'admin' : 'client';
+        const userFullName = userData.name || userData.full_name || userData.username || userData.email || '';
+        const userUsername = userData.username || userData.email || '';
+        setRole(userRole);
+        setFullName(userFullName);
+        setUsername(userUsername);
+    }, []);
+
+    const fetchUserData = useCallback(async () => {
+        if (fetchUserDataPromiseRef.current) return fetchUserDataPromiseRef.current;
+
+        fetchUserDataPromiseRef.current = (async () => {
+            console.log("DEBUG: fetchUserData started");
+            try {
+                // Fetch the user from the Cognito auth service
+                const userData = await auth.getUser();
+                console.log("DEBUG: getUser returned", userData);
+
+                if (userData) {
+                    applyUserData(userData);
+                    return;
+                }
+
+                const { data: { session: currentSession } } = await auth.getSession();
+                if (currentSession) {
+                    console.warn("DEBUG: Profile unavailable. Continuing with authenticated session.");
+                    applyUserData(currentSession.user || {});
+                    return;
+                }
+
+                console.warn("DEBUG: No auth session found after profile lookup. Signing out.");
+                await auth.signOut();
+                setSession(null);
+                setRole(null);
+                setFullName(null);
+                setUsername(null);
+                setLoading(false);
+            } catch (err) {
+                console.error("DEBUG: Error fetching user profile data", err);
+                // Try /users/profile as fallback
+                try {
+                    const profile = await apiFetch('/users/profile');
+                    if (profile) {
+                        applyUserData(profile);
+                        return;
+                    }
+                } catch (profileErr) {
+                    console.error("DEBUG: /users/profile fallback also failed", profileErr);
+                }
+
+                const { data: { session: currentSession } } = await auth.getSession();
+                if (currentSession) {
+                    console.warn("DEBUG: Continuing with cached authenticated session after profile errors.");
+                    applyUserData(currentSession.user || {});
+                }
+            }
+        })();
+
+        try {
+            return await fetchUserDataPromiseRef.current;
+        } finally {
+            fetchUserDataPromiseRef.current = null;
+        }
+    }, [applyUserData]);
+
+    const handleAuthSuccess = useCallback(async () => {
+        setLoading(true);
+        try {
+            await fetchUserData();
+            const { data: { session: freshSession } } = await auth.getSession();
+            setSession(freshSession);
+        } catch (err) {
+            console.error("DEBUG: Error completing auth handoff", err);
+            toast.error("Signed in, but couldn't load your workspace. Please refresh once.");
+        } finally {
+            setLoading(false);
+        }
+    }, [fetchUserData]);
 
     useEffect(() => {
         let mounted = true;
@@ -71,79 +155,7 @@ export default function App() {
             mounted = false;
             subscription.unsubscribe();
         };
-    }, []);
-
-    const applyUserData = (userData = {}) => {
-        // Auth is owned by Cognito/NestJS now; profile data is useful for UI,
-        // but missing profile fields should not block a valid login session.
-        const userRole = userData.role || userData['custom:role'] || 'client';
-        const userFullName = userData.name || userData.full_name || userData.username || userData.email || '';
-        const userUsername = userData.username || userData.email || '';
-        setRole(userRole);
-        setFullName(userFullName);
-        setUsername(userUsername);
-    };
-
-    const fetchUserData = async () => {
-        console.log("DEBUG: fetchUserData started");
-        try {
-            // Fetch the user from the Cognito auth service
-            const userData = await auth.getUser();
-            console.log("DEBUG: getUser returned", userData);
-
-            if (userData) {
-                applyUserData(userData);
-                return;
-            }
-
-            const { data: { session: currentSession } } = await auth.getSession();
-            if (currentSession) {
-                console.warn("DEBUG: Profile unavailable. Continuing with authenticated session.");
-                applyUserData(currentSession.user || {});
-                return;
-            }
-
-            console.warn("DEBUG: No auth session found after profile lookup. Signing out.");
-            await auth.signOut();
-            setSession(null);
-            setRole(null);
-            setFullName(null);
-            setUsername(null);
-            setLoading(false);
-        } catch (err) {
-            console.error("DEBUG: Error fetching user profile data", err);
-            // Try /users/profile as fallback
-            try {
-                const profile = await apiFetch('/users/profile');
-                if (profile) {
-                    applyUserData(profile);
-                    return;
-                }
-            } catch (profileErr) {
-                console.error("DEBUG: /users/profile fallback also failed", profileErr);
-            }
-
-            const { data: { session: currentSession } } = await auth.getSession();
-            if (currentSession) {
-                console.warn("DEBUG: Continuing with cached authenticated session after profile errors.");
-                applyUserData(currentSession.user || {});
-            }
-        }
-    };
-
-    const handleAuthSuccess = async () => {
-        setLoading(true);
-        try {
-            await fetchUserData();
-            const { data: { session: freshSession } } = await auth.getSession();
-            setSession(freshSession);
-        } catch (err) {
-            console.error("DEBUG: Error completing auth handoff", err);
-            toast.error("Signed in, but couldn't load your workspace. Please refresh once.");
-        } finally {
-            setLoading(false);
-        }
-    };
+    }, [fetchUserData]);
 
     // Auto-Logout if idle for 15 minutes
     useEffect(() => {
