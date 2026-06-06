@@ -13,13 +13,35 @@ const KEYS = {
   USER: 'pw_user',
 };
 
+let googleInitialized = false;
+let googleSuccessHandler = null;
+let googleErrorHandler = null;
+let googleExchangePromise = null;
+
 // ── token helpers ─────────────────────────────────────────────────────────
 export function getAccessToken() {
-  return localStorage.getItem(KEYS.ACCESS);
+  const raw = localStorage.getItem(KEYS.ACCESS);
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) return parsed.join('.');
+    if (typeof parsed === 'string') return parsed;
+  } catch {
+    // Stored value is already a plain JWT string.
+  }
+
+  return raw;
 }
 
 function setAccessToken(token) {
-  localStorage.setItem(KEYS.ACCESS, token);
+  if (Array.isArray(token)) {
+    localStorage.setItem(KEYS.ACCESS, token.join('.'));
+    return;
+  }
+  if (typeof token === 'string') {
+    localStorage.setItem(KEYS.ACCESS, token);
+  }
 }
 
 function emitAuthChange() {
@@ -83,12 +105,13 @@ export function isLoggedIn() {
 
 // ── core fetch — always credentials:include for cookie ────────────────────
 async function authFetch(path, options = {}) {
+  const { _retry, skipRefresh, ...fetchOptions } = options;
   const token = getAccessToken();
-  const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
+  const headers = { 'Content-Type': 'application/json', ...(fetchOptions.headers || {}) };
   if (token) headers['Authorization'] = `Bearer ${token}`;
 
   const res = await fetch(`${AUTH_BASE}${path}`, {
-    ...options,
+    ...fetchOptions,
     headers,
     credentials: 'include', // sends httpOnly refresh_token cookie
   });
@@ -96,10 +119,10 @@ async function authFetch(path, options = {}) {
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     // Try auto-refresh on 401 (only once)
-    if (res.status === 401 && !options._retry) {
+    if (res.status === 401 && !_retry && !skipRefresh) {
       try {
         await auth.refresh();
-        return authFetch(path, { ...options, _retry: true });
+        return authFetch(path, { ...fetchOptions, _retry: true });
       } catch {
         clearTokens();
         throw Object.assign(new Error('Session expired'), { status: 401 });
@@ -116,6 +139,7 @@ export const auth = {
   async signUp({ email, password, first_name, last_name }) {
     return authFetch('/auth/signup', {
       method: 'POST',
+      skipRefresh: true,
       body: JSON.stringify({ email, password, first_name, last_name }),
     });
   },
@@ -124,6 +148,7 @@ export const auth = {
   async confirmSignUp({ email, code }) {
     return authFetch('/auth/confirm', {
       method: 'POST',
+      skipRefresh: true,
       body: JSON.stringify({ email, code }),
     });
   },
@@ -132,6 +157,7 @@ export const auth = {
   async signIn({ email, password }) {
     const data = await authFetch('/auth/login', {
       method: 'POST',
+      skipRefresh: true,
       body: JSON.stringify({ email, password }),
     });
     if (data.access_token) setAccessToken(data.access_token);
@@ -162,7 +188,7 @@ export const auth = {
   async getUser() {
     if (!getAccessToken()) return null;
     try {
-      const user = await authFetch('/auth/profile');
+      const user = await authFetch('/auth/profile', { skipRefresh: true });
       return setCachedUser(user);
     } catch {
       // Keep the current route alive when only profile hydration fails.
@@ -180,28 +206,42 @@ export const auth = {
   },
 
   async signInWithGoogle(idToken) {
-    // Browser gets a Google ID token; NestJS verifies it and returns Cognito tokens.
-    const data = await authFetch('/auth/google', {
-      method: 'POST',
-      body: JSON.stringify({ idToken, id_token: idToken }),
-    });
-    if (data.access_token) setAccessToken(data.access_token);
-    // Cache Google profile claims as a fallback so a successful OAuth exchange
-    // can advance even before the backend profile endpoint responds.
-    const user = await auth.getUser();
-    if (!user) {
-      const claims = decodeJwtPayload(idToken);
-      setCachedUser({
-        email: claims.email,
-        name: claims.name,
-        first_name: claims.given_name,
-        last_name: claims.family_name,
-        username: claims.email,
-        role: 'client',
-      });
+    if (!idToken) {
+      throw new Error('Google sign in did not return a credential.');
     }
-    emitAuthChange();
-    return data;
+
+    if (googleExchangePromise) return googleExchangePromise;
+
+    const claims = decodeJwtPayload(idToken);
+    googleExchangePromise = (async () => {
+      // Browser gets a Google ID token; NestJS verifies it and returns Cognito tokens.
+      const data = await authFetch('/auth/google', {
+        method: 'POST',
+        skipRefresh: true,
+        body: JSON.stringify({ idToken, id_token: idToken }),
+      });
+      if (data.access_token) setAccessToken(data.access_token);
+      // Cache Google profile claims as a fallback so a successful OAuth exchange
+      // can advance even before the backend profile endpoint responds.
+      const user = await auth.getUser();
+      setCachedUser({
+        ...user,
+        email: user?.email || claims.email,
+        name: user?.name || claims.name,
+        first_name: user?.first_name || claims.given_name,
+        last_name: user?.last_name || claims.family_name,
+        username: user?.username || claims.email,
+        role: user?.role || 'client',
+      });
+      emitAuthChange();
+      return data;
+    })();
+
+    try {
+      return await googleExchangePromise;
+    } finally {
+      googleExchangePromise = null;
+    }
   },
 
   loadGoogleIdentity() {
@@ -233,15 +273,20 @@ export const auth = {
   },
 
   async initializeGoogle(onSuccess, onError) {
+    googleSuccessHandler = onSuccess;
+    googleErrorHandler = onError;
+
     const google = await auth.loadGoogleIdentity();
+    if (googleInitialized) return;
+
     google.accounts.id.initialize({
       client_id: GOOGLE_CLIENT_ID,
       callback: async ({ credential }) => {
         try {
           await auth.signInWithGoogle(credential);
-          onSuccess?.();
+          googleSuccessHandler?.();
         } catch (err) {
-          onError?.(err);
+          googleErrorHandler?.(err);
         }
       },
       auto_select: false,
@@ -250,6 +295,7 @@ export const auth = {
       itp_support: true,
       ux_mode: 'popup',
     });
+    googleInitialized = true;
   },
 
   promptGoogle() {
@@ -262,6 +308,7 @@ export const auth = {
   async forgotPassword(email) {
     return authFetch('/auth/forgot-password', {
       method: 'POST',
+      skipRefresh: true,
       body: JSON.stringify({ email }),
     });
   },
@@ -269,6 +316,7 @@ export const auth = {
   async confirmForgotPassword({ email, code, new_password }) {
     return authFetch('/auth/forgot-password/confirm', {
       method: 'POST',
+      skipRefresh: true,
       body: JSON.stringify({ email, code, new_password }),
     });
   },
@@ -299,7 +347,8 @@ export const auth = {
   onAuthStateChange(callback) {
     const fire = () => {
       const token = getAccessToken();
-      if (token) callback('SIGNED_IN', { session: { access_token: token } });
+      const user = getCachedUser();
+      if (token) callback('SIGNED_IN', { access_token: token, user });
       else callback('SIGNED_OUT', null);
     };
     window.addEventListener('storage', fire);

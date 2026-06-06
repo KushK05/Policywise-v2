@@ -31,6 +31,15 @@ function SubmitButton({ loading, label, loadingLabel, disabled }) {
     );
 }
 
+function getGoogleErrorMessage(err) {
+    const msg = err?.message || '';
+    const lower = msg.toLowerCase();
+    if (lower.includes('incorrect username or password') || lower.includes('cognito authentication failed')) {
+        return 'Google sign-in could not complete for this email. If you already have an account, sign in with email and password.';
+    }
+    return msg || 'Google sign in failed.';
+}
+
 // ── main component ─────────────────────────────────────────────────────────
 /**
  * view states: 'signin' | 'signup' | 'confirm' | 'forgot' | 'forgot-confirm'
@@ -78,7 +87,7 @@ export default function Auth({ onAuthSuccess }) {
                 if (onAuthSuccess) onAuthSuccess();
                 else window.location.reload();
             },
-            (err) => toast.error(err.message || 'Google sign in failed.')
+            (err) => toast.error(getGoogleErrorMessage(err))
         ).then(() => {
             if (cancelled) return;
             setGoogleReady(true);
@@ -153,13 +162,13 @@ export default function Auth({ onAuthSuccess }) {
                         if (onAuthSuccess) onAuthSuccess();
                         else window.location.reload();
                     },
-                    (err) => toast.error(err.message || 'Google sign in failed.')
+                    (err) => toast.error(getGoogleErrorMessage(err))
                 );
                 setGoogleReady(true);
             }
             auth.promptGoogle();
         } catch (err) {
-            toast.error(err.message || 'Google sign in is not available.');
+            toast.error(getGoogleErrorMessage(err) || 'Google sign in is not available.');
         }
     };
 

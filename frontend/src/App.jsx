@@ -131,6 +131,20 @@ export default function App() {
         }
     };
 
+    const handleAuthSuccess = async () => {
+        setLoading(true);
+        try {
+            await fetchUserData();
+            const { data: { session: freshSession } } = await auth.getSession();
+            setSession(freshSession);
+        } catch (err) {
+            console.error("DEBUG: Error completing auth handoff", err);
+            toast.error("Signed in, but couldn't load your workspace. Please refresh once.");
+        } finally {
+            setLoading(false);
+        }
+    };
+
     // Auto-Logout if idle for 15 minutes
     useEffect(() => {
         let timeoutId;
@@ -174,6 +188,14 @@ export default function App() {
         );
     }
 
+    const resolvingRole = session && !role;
+    const routeLoader = (
+        <div className="min-h-screen flex flex-col items-center justify-center font-sans bg-slate-50">
+            <div className="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin mb-4"></div>
+            <div className="text-slate-500 font-bold animate-pulse text-sm uppercase tracking-widest">Opening Workspace...</div>
+        </div>
+    );
+
     return (
         <BrowserRouter>
             <Toaster position="top-right" />
@@ -181,7 +203,7 @@ export default function App() {
                 {/* Public / Auth Route */}
                 <Route
                     path="/login"
-                    element={!session ? <Auth onAuthSuccess={() => window.location.reload()} /> : <Navigate to={role === 'admin' ? '/admin' : '/dashboard'} replace />}
+                    element={!session ? <Auth onAuthSuccess={handleAuthSuccess} /> : resolvingRole ? routeLoader : <Navigate to={role === 'admin' ? '/admin' : '/dashboard'} replace />}
                 />
 
                 <Route
@@ -192,7 +214,7 @@ export default function App() {
                 {/* Client Routes */}
                 <Route
                     path="/dashboard"
-                    element={session && role === 'client' ? <ClientDashboard session={session} fullName={fullName} username={username} /> : <Navigate to="/login" replace />}
+                    element={!session ? <Navigate to="/login" replace /> : resolvingRole ? routeLoader : role === 'client' ? <ClientDashboard session={session} fullName={fullName} username={username} /> : <Navigate to="/admin" replace />}
                 />
 
                 <Route
@@ -208,7 +230,7 @@ export default function App() {
                 {/* Admin Routes */}
                 <Route
                     path="/admin"
-                    element={session && role === 'admin' ? <AdminDashboard session={session} fullName={fullName} /> : <Navigate to="/dashboard" replace />}
+                    element={!session ? <Navigate to="/login" replace /> : resolvingRole ? routeLoader : role === 'admin' ? <AdminDashboard session={session} fullName={fullName} /> : <Navigate to="/dashboard" replace />}
                 />
 
                 {/* Default Catch-all */}
